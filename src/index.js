@@ -7,6 +7,7 @@
 // ---------------------------------------------------------------------------
 
 import * as db from "./db.js";
+import { verifyTicketPayment } from "./treasury.js";
 
 // Upcoming events shown on the ticket page. Edit this list as you book cards.
 // (Kept as config so you don't need a separate events table.)
@@ -46,6 +47,24 @@ function safeEqual(a, b) {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+
+// Client-side script for the "verify now" button on the payment page.
+const verifyScript = `<script>
+(function(){
+  var b=document.getElementById('verifyBtn'); if(!b) return;
+  var out=document.getElementById('verifyResult');
+  b.addEventListener('click', async function(){
+    b.disabled=true; var old=b.textContent; b.textContent='Checking…';
+    try{
+      var r=await fetch('/tickets/verify?memo='+encodeURIComponent(b.dataset.memo));
+      var d=await r.json();
+      if(d.status==='paid'){ out.innerHTML='<div class="note"><b class="win">Payment confirmed — you are in! 🎟️</b></div>'; b.style.display='none'; }
+      else if(d.status==='pending'){ out.innerHTML='<div class="note">No full payment seen yet'+(d.paid_so_far?(' ('+d.paid_so_far+' / '+d.needed+')'):'')+'. If you just paid, give it a moment and try again.</div>'; b.disabled=false; b.textContent=old; }
+      else { out.innerHTML='<div class="note" style="color:var(--red2)">Could not verify yet: '+(d.error||'unknown')+'</div>'; b.disabled=false; b.textContent=old; }
+    }catch(e){ out.innerHTML='<div class="note" style="color:var(--red2)">Network error — try again.</div>'; b.disabled=false; b.textContent=old; }
+  });
+})();
+</script>`;
 
 // ---------------------------------------------------------------------------
 // layout
@@ -395,11 +414,13 @@ async function ticketBuy(env, request) {
     To confirm, run this in-game:</p>
     <div class="memo">/pay ${esc(PAY_TO)} ${ev.price} ${esc(t.memo)}</div>
     <p class="muted" style="margin-top:14px">The 32-character code is your unique memo. Include it exactly.
-    Once the payment lands, your ticket is automatically marked <b>paid</b>.</p>
+    After you pay, hit the button below and we'll verify it against the GFC treasury.</p>
     <div style="display:flex;gap:10px;margin-top:18px">
-      <a class="btn" href="/tickets/status?memo=${esc(t.memo)}">Check Status</a>
-      <a class="btn ghost" href="/tickets">Back to Tickets</a>
+      <button class="btn" id="verifyBtn" data-memo="${esc(t.memo)}">I've paid — verify now</button>
+      <a class="btn ghost" href="/tickets/status?memo=${esc(t.memo)}">Check Status</a>
     </div>
+    <div id="verifyResult" style="margin-top:14px"></div>
+    ${verifyScript}
   </div></section>`;
   return html(layout("Confirm payment", content));
 }
@@ -418,7 +439,13 @@ async function ticketStatus(env, memo) {
         <div class="name">${esc(t.event_name)}</div>
         <div class="muted">${esc(t.tier)} · ${t.price}</div>
         <p>Status: <b class="${cls}">${esc(t.status.toUpperCase())}</b></p>
-        ${t.status === "pending" ? `<div class="memo" style="font-size:15px">/pay ${esc(PAY_TO)} ${t.price} ${esc(t.memo)}</div>` : ""}
+        ${
+          t.status === "pending"
+            ? `<div class="memo" style="font-size:15px">/pay ${esc(PAY_TO)} ${t.price} ${esc(t.memo)}</div>
+               <div style="margin-top:12px"><button class="btn" id="verifyBtn" data-memo="${esc(t.memo)}">I've paid — verify now</button></div>
+               <div id="verifyResult" style="margin-top:12px"></div>`
+            : ""
+        }
         ${t.paid_at ? `<div class="muted" style="margin-top:8px">Paid ${esc(t.paid_at)}</div>` : ""}
       </div>`;
     }
@@ -426,8 +453,44 @@ async function ticketStatus(env, memo) {
   const content = `<section class="section"><div class="wrap" style="max-width:640px">
     <a class="muted" href="/tickets">← Tickets</a>
     <h1 style="margin-top:12px">Ticket Status</h1>${inner}
+    ${verifyScript}
   </div></section>`;
   return html(layout("Ticket status", content));
+}
+
+// ---------------------------------------------------------------------------
+// site-side verification — buyer clicks "I've paid", site checks the ledger
+// ---------------------------------------------------------------------------
+// GET /tickets/verify?memo=<32 chars>
+// Pulls the GFC firm ledger via treasury.js, sums transactions matching the
+// memo, marks the ticket paid when the total covers the price. No bot required.
+async function ticketVerify(env, memo) {
+  memo = String(memo || "").trim();
+  if (!memo) return json({ ok: false, error: "missing memo" }, 400);
+
+  const ticket = await db.getTicketByMemo(env.DB, memo);
+  if (!ticket) return json({ ok: false, error: "no ticket for that memo" }, 404);
+  if (ticket.status === "paid") return json({ ok: true, status: "paid", ticket_id: ticket.id });
+  if (ticket.status === "cancelled") return json({ ok: false, error: "ticket cancelled" }, 409);
+
+  let result;
+  try {
+    result = await verifyTicketPayment(env, ticket);
+  } catch (e) {
+    // Treasury not configured yet, or API error — report cleanly, don't crash.
+    return json({ ok: false, status: "unverified", error: e.message }, 502);
+  }
+
+  if (result.paid) {
+    await db.markTicketPaid(env.DB, memo, result.payer);
+    return json({ ok: true, status: "paid", ticket_id: ticket.id, event: ticket.event_name });
+  }
+  return json({
+    ok: true,
+    status: "pending",
+    paid_so_far: result.paidSoFar,
+    needed: result.needed,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +556,7 @@ export default {
       if (path === "/news") return await pageNewsList(env);
       if (path === "/tickets") return pageTickets();
       if (path === "/tickets/status") return await ticketStatus(env, url.searchParams.get("memo"));
+      if (path === "/tickets/verify") return await ticketVerify(env, url.searchParams.get("memo"));
 
       let m;
       if ((m = path.match(/^\/fighter\/(\d+)$/))) return await pageFighter(env, parseInt(m[1], 10));
