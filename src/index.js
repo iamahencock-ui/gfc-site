@@ -32,7 +32,20 @@ const esc = (s) =>
 const html = (body, status = 200) =>
   new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 
+const json = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+
 const redirect = (location) => new Response(null, { status: 302, headers: { location } });
+
+// Constant-time string compare so the secret check can't be timed.
+function safeEqual(a, b) {
+  a = String(a || "");
+  b = String(b || "");
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
 
 // ---------------------------------------------------------------------------
 // layout
@@ -418,6 +431,49 @@ async function ticketStatus(env, memo) {
 }
 
 // ---------------------------------------------------------------------------
+// webhook — the bot calls this when an in-game /pay with a memo lands
+// ---------------------------------------------------------------------------
+// POST /webhook/payment
+//   header:  x-gfc-secret: <WEBHOOK_SECRET>
+//   body:    { "memo": "<32 chars>", "payer": "<mc name>", "amount": <number> }
+// Set the secret once with:  npx wrangler secret put WEBHOOK_SECRET
+async function webhookPayment(env, request) {
+  // 1. auth — shared secret, constant-time compare
+  if (!env.WEBHOOK_SECRET) return json({ ok: false, error: "server missing WEBHOOK_SECRET" }, 500);
+  if (!safeEqual(request.headers.get("x-gfc-secret"), env.WEBHOOK_SECRET))
+    return json({ ok: false, error: "unauthorized" }, 401);
+
+  // 2. parse
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+  const memo = String(body.memo || "").trim();
+  const payer = body.payer || body.buyer || null;
+  const amount = body.amount != null ? Number(body.amount) : null;
+  if (!memo) return json({ ok: false, error: "missing memo" }, 400);
+
+  // 3. look up the ticket
+  const ticket = await db.getTicketByMemo(env.DB, memo);
+  if (!ticket) return json({ ok: false, error: "no ticket for that memo" }, 404);
+  if (ticket.status === "cancelled") return json({ ok: false, error: "ticket cancelled" }, 409);
+  if (ticket.status === "paid")
+    return json({ ok: true, status: "already_paid", ticket_id: ticket.id }); // idempotent
+
+  // 4. amount check (reject underpayment; ignore if bot doesn't send amount)
+  if (amount != null && amount < ticket.price)
+    return json({ ok: false, error: "amount too low", expected: ticket.price, got: amount }, 402);
+
+  // 5. mark paid
+  const flipped = await db.markTicketPaid(env.DB, memo, payer);
+  return json({
+    ok: true,
+    status: flipped ? "paid" : "unchanged",
+    ticket_id: ticket.id,
+    event: ticket.event_name,
+    buyer: payer || ticket.buyer_mc_username,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // router
 // ---------------------------------------------------------------------------
 export default {
@@ -426,6 +482,7 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
     try {
+      if (request.method === "POST" && path === "/webhook/payment") return await webhookPayment(env, request);
       if (request.method === "POST" && path === "/tickets/buy") return await ticketBuy(env, request);
 
       if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
