@@ -1,0 +1,9 @@
+name = "gfc-site"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+
+# Binds the live GFC database. The site reads `env.DB`.
+[[d1_databases]]
+binding = "DB"
+database_name = "gfc-db"
+database_id = "f871e034-19ba-44aa-9e28-3a78926aba9d"
